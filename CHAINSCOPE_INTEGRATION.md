@@ -41,6 +41,20 @@ fdtn-ai/Foundation-Sec-8B:featherless-ai
 Foundation-Sec as the default when the router's `/v1/models` omits it — so the
 ChainScope backend is always selectable.
 
+## Startup note: 033 is not idempotent
+
+`database/init/033_generations_deepseek_codex.sql` unconditionally runs
+`ADD CONSTRAINT generations_check`, so it re-adds the **pre-hf** definition on
+every startup. If any row already uses `model_provider='hf'`, 033 fails and 034
+never runs — leaving the backend unable to boot.
+
+The migration order is 033 → 034, so this is self-healing on a clean database:
+clear any `hf` rows once, restart, and 034 installs the correct constraint.
+
+`034` keeps every statement on one line because `backend/prisma/migrate.js`
+splits the file naively on `;`; a multi-line `CHECK` would be cut mid-statement
+and leave the constraint half-applied.
+
 ## Tests
 
 ```
