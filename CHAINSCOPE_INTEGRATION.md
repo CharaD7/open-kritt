@@ -79,3 +79,32 @@ called CONFIRMED. Foundation-Sec serves as that second opinion via
 `core/cs_sec_model.review_hosted()`.
 
 Generation alone is not evidence. Keep the verdict gate between the two.
+
+## Memory gate (why jobs never started)
+
+The engine refuses to start a runner unless the host has
+`ENGINE_MEMORY_RESERVE_GB + ENGINE_SCAN_RUNNER_MEMORY_RESERVATION_MB` free.
+Defaults are `2` and `1536`, i.e. **3.5 GiB required**.
+
+Three things make this hard to change:
+
+1. **`.env` overrides `docker-compose.yml`.** `${VAR:-default}` uses the `.env`
+   value when present, so editing compose alone does nothing.
+2. **`docker compose restart` keeps the old container env.** Env changes need
+   `--force-recreate`.
+3. **The engine syncs container env back into `/data/engine-runtime.env` on
+   startup**, so editing that file directly is overwritten on the next boot.
+
+On a host with ~3.5 GiB free, set in `.env`:
+
+```
+ENGINE_MEMORY_RESERVE_GB=0.5
+ENGINE_SCAN_RUNNER_MEMORY_MB=1024
+ENGINE_SCAN_RUNNER_MEMORY_RESERVATION_MB=512
+ENGINE_MIN_FREE_STORAGE_GB=5
+ENGINE_IGNORE_LOW_STORAGE=true
+```
+
+Then `docker compose up -d --force-recreate engine`. The startup line should
+read `0.500 GiB reserve, 0.500 GiB reservation per runner, 1.000 GiB hard cap`
+and the `waiting for memory` warning must be gone.
