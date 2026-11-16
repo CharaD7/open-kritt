@@ -115,9 +115,11 @@ services:
       ENGINE_AUTOSCALE_SCAN_WORKERS_ON_PROVIDER_CAPACITY: ${ENGINE_AUTOSCALE_SCAN_WORKERS_ON_PROVIDER_CAPACITY:-true}
       ENGINE_CODEX_MAX_SUBAGENTS_PER_SESSION: ${ENGINE_CODEX_MAX_SUBAGENTS_PER_SESSION:-5}
       ENGINE_CODEX_FAST_MODE: ${ENGINE_CODEX_FAST_MODE:-false}
-      ENGINE_MEMORY_RESERVE_GB: ${ENGINE_MEMORY_RESERVE_GB:-2}
-      ENGINE_SCAN_RUNNER_MEMORY_MB: ${ENGINE_SCAN_RUNNER_MEMORY_MB:-1536}
-      ENGINE_SCAN_RUNNER_MEMORY_RESERVATION_MB: ${ENGINE_SCAN_RUNNER_MEMORY_RESERVATION_MB:-${ENGINE_SCAN_RUNNER_MEMORY_MB:-1536}}
+      # Lowered for this host: ~3.5 GiB free, below the 3.5 GiB default
+      # (2 GiB Docker reserve + 1.5 GiB runner). Without this, no runner is admitted.
+      ENGINE_MEMORY_RESERVE_GB: ${ENGINE_MEMORY_RESERVE_GB:-0.5}
+      ENGINE_SCAN_RUNNER_MEMORY_MB: ${ENGINE_SCAN_RUNNER_MEMORY_MB:-1024}
+      ENGINE_SCAN_RUNNER_MEMORY_RESERVATION_MB: ${ENGINE_SCAN_RUNNER_MEMORY_RESERVATION_MB:-512}
       ENGINE_SCAN_RUNNER_CPUS: ${ENGINE_SCAN_RUNNER_CPUS:-0}
       ENGINE_SCAN_RUNNER_OOM_SCORE_ADJ: ${ENGINE_SCAN_RUNNER_OOM_SCORE_ADJ:-500}
       ENGINE_MEMORY_PRESSURE_EVICTION_ENABLED: ${ENGINE_MEMORY_PRESSURE_EVICTION_ENABLED:-false}
@@ -146,6 +148,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       HF_TOKEN: ${HF_TOKEN:-}
+      HF_CODEX_BASE_URL: ${HF_CODEX_BASE_URL:-http://172.17.0.1:8099/v1}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
       CURSOR_API_KEY: ${CURSOR_API_KEY:-}
@@ -238,6 +241,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Responses-API shim. codex-cli sends `namespace` (MCP) and `web_search`
+# tool entries; strict Responses implementations (the HuggingFace router in
+# front of Foundation-Sec) reject the whole request. This strips them.
+  responses-shim:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.shim
+    container_name: open-kritt-responses-shim
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      SHIM_UPSTREAM: ${SHIM_UPSTREAM:-https://router.huggingface.co/v1}
+      SHIM_PORT: "8099"
+    ports:
+      - '127.0.0.1:${SHIM_PORT:-8099}:8099'
+    restart: unless-stopped
+    networks:
+      - default
 
   db:
     build:
