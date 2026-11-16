@@ -23,6 +23,11 @@ from .provider_credentials import provider_environment
 LOGGER = logging.getLogger("open_kritt_engine")
 ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
+HF_MODELS_URL = "https://router.huggingface.co/v1/models"
+# Foundation-Sec is the ChainScope preferred backend; it is the security
+# specialist rather than a general model, so it is the default here.
+HF_DEFAULT_MODEL_ID = "fdtn-ai/Foundation-Sec-8B:featherless-ai"
+HF_THINKING_EFFORTS: tuple[str, ...] = ()
 DEEPSEEK_DEFAULT_MODEL_ID = "deepseek-flash"
 DEEPSEEK_THINKING_EFFORTS = ("low", "high", "max")
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models/user"
@@ -546,6 +551,65 @@ def fetch_deepseek_models(api_key: str, timeout_seconds: float) -> tuple[list[di
     return models, default_model
 
 
+def fetch_hf_models(api_key: str, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
+    """List models available under the configured HuggingFace token.
+
+    The HF router is OpenAI-compatible and lists its catalogue at /v1/models.
+    Model ids carry an optional ":provider" suffix; Foundation-Sec is only
+    reachable with it, so the id is preserved verbatim.
+    """
+
+    request = Request(
+        HF_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urlopen(request, timeout=max(1.0, timeout_seconds)) as response:  # noqa: S310 - fixed provider URL
+            raw_payload = response.read(MAX_HTTP_CATALOG_BYTES + 1)
+        if len(raw_payload) > MAX_HTTP_CATALOG_BYTES:
+            raise ModelCatalogError("HuggingFace model catalog response was too large")
+        payload = json.loads(raw_payload)
+    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelCatalogError("Could not read the HuggingFace model catalog") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ModelCatalogError("HuggingFace model catalog response was invalid")
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in payload["data"]:
+        if not isinstance(raw, Mapping):
+            continue
+        model_id = _clean_text(raw.get("id"))
+        if not model_id or model_id in seen_ids:
+            continue
+        seen_ids.add(model_id)
+        entries.append(
+            {
+                "model": model_id,
+                "displayName": model_id,
+                "supportedReasoningEfforts": list(HF_THINKING_EFFORTS),
+                "isDefault": model_id == HF_DEFAULT_MODEL_ID,
+            }
+        )
+        if len(entries) >= MAX_CATALOG_MODELS:
+            break
+
+    # The router lists many models; if the specialist is absent, surface it
+        # explicitly so ChainScope's preferred backend is always selectable.
+    if not any(entry["isDefault"] for entry in entries):
+        entries.insert(0, {
+            "model": HF_DEFAULT_MODEL_ID,
+            "displayName": HF_DEFAULT_MODEL_ID,
+            "supportedReasoningEfforts": [],
+            "isDefault": True,
+        })
+
+    models, default_model = normalize_catalog_models(entries)
+    if not models:
+        raise ModelCatalogError("HuggingFace model catalog was empty")
+    return models, default_model
+
+
 def fetch_xai_models(api_key: str, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
     """List models available under the configured xAI API key."""
 
@@ -620,6 +684,7 @@ class ModelCatalogRefresher:
         fetch_deepseek: CatalogFetcher | None = None,
         fetch_openrouter: CatalogFetcher | None = None,
         fetch_xai: CatalogFetcher | None = None,
+        fetch_hf: CatalogFetcher | None = None,
         codex_cli_gate: Any | None = None,
     ):
         self.db = db
@@ -630,6 +695,7 @@ class ModelCatalogRefresher:
         self.fetch_deepseek = fetch_deepseek
         self.fetch_openrouter = fetch_openrouter
         self.fetch_xai = fetch_xai
+        self.fetch_hf = fetch_hf
         self.codex_cli_gate = codex_cli_gate
 
     def refresh(self, env: Mapping[str, str] | None = None) -> dict[str, bool]:
@@ -664,6 +730,10 @@ class ModelCatalogRefresher:
         if _clean_text(env.get("XAI_API_KEY")):
             fetch_xai = self.fetch_xai or (lambda: fetch_xai_models(env["XAI_API_KEY"], self.timeout_seconds))
             outcomes["xai"] = self._refresh_provider("xai", fetch_xai)
+        hf_key = _clean_text(env.get("HF_TOKEN")) or _clean_text(env.get("HUGGINGFACE_API_KEY"))
+        if hf_key:
+            fetch_hf = self.fetch_hf or (lambda: fetch_hf_models(hf_key, self.timeout_seconds))
+            outcomes["hf"] = self._refresh_provider("hf", fetch_hf)
         return outcomes
 
     def _refresh_provider(self, provider: str, fetcher: CatalogFetcher) -> bool:

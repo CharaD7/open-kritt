@@ -15,6 +15,7 @@ from open_kritt_engine.model_catalog import (
     fetch_anthropic_models,
     fetch_codex_models,
     fetch_deepseek_models,
+    fetch_hf_models,
     fetch_openrouter_models,
     fetch_xai_models,
     model_supports_service_tier,
@@ -589,3 +590,49 @@ def test_refresher_never_persists_openrouter_failure_details():
         {"provider": "openrouter", "error": "Unable to refresh the provider model catalog."},
     ]
     assert secret not in json.dumps(db.errors)
+
+def test_fetch_hf_models_keeps_provider_suffix_and_marks_foundation_sec(monkeypatch):
+    """Foundation-Sec is only reachable with its ':featherless-ai' suffix, so
+    the id must be preserved verbatim and be the default."""
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "meta-llama/Llama-3.1-8B-Instruct"},
+                        {"id": "fdtn-ai/Foundation-Sec-8B:featherless-ai"},
+                    ]
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
+    models, default_model = fetch_hf_models("hf-test-key", 2)
+
+    ids = [model["id"] for model in models]
+    assert "fdtn-ai/Foundation-Sec-8B:featherless-ai" in ids
+    assert default_model == "fdtn-ai/Foundation-Sec-8B:featherless-ai"
+    request, timeout = requests[0]
+    assert request.full_url == "https://router.huggingface.co/v1/models"
+    assert request.get_header("Authorization") == "Bearer hf-test-key"
+    assert timeout == 2
+
+
+def test_fetch_hf_models_injects_foundation_sec_when_router_omits_it(monkeypatch):
+    """The router may not list the specialist; the catalog must still offer it
+    so ChainScope's preferred backend is always selectable."""
+
+    def fake_urlopen(request, timeout):
+        return io.BytesIO(
+            json.dumps({"data": [{"id": "meta-llama/Llama-3.1-8B-Instruct"}]}).encode("utf-8")
+        )
+
+    monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
+    models, default_model = fetch_hf_models("hf-test-key", 2)
+
+    assert models[0]["id"] == "fdtn-ai/Foundation-Sec-8B:featherless-ai"
+    assert models[0]["isDefault"] is True
+    assert default_model == "fdtn-ai/Foundation-Sec-8B:featherless-ai"

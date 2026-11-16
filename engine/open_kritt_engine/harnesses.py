@@ -184,6 +184,9 @@ OPENROUTER_CLAUDE_BASE_URL = "https://openrouter.ai/api"
 OPENROUTER_CURSOR_BASE_URL = "https://openrouter.ai/api/v1/cursor"
 OPENROUTER_CODEX_BASE_URL = "https://openrouter.ai/api/v1"
 DEEPSEEK_CODEX_BASE_URL = "https://api.deepseek.com"
+# HuggingFace Inference Router - OpenAI-compatible. Foundation-Sec is reached
+# as "<owner>/<name>:<provider>", e.g. fdtn-ai/Foundation-Sec-8B:featherless-ai.
+HF_CODEX_BASE_URL = "https://router.huggingface.co/v1"
 DEEPSEEK_CODEX_MODEL_CATALOG = "/app/open_kritt_engine/deepseek_models.json"
 OPENROUTER_MODEL_ALIASES = {
     "glm-5.2": "z-ai/glm-5.2",
@@ -203,7 +206,7 @@ CLAUDE_MODEL_ALIASES = {
     "opus-4.8": "claude-opus-4-8",
 }
 DEFAULT_MODEL_PROVIDER = "openrouter"
-MODEL_PROVIDERS = {"codex", "claude", "openrouter", "xai", "deepseek"}
+MODEL_PROVIDERS = {"codex", "claude", "openrouter", "xai", "deepseek", "hf"}
 GROK_BUILD_THINKING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 DEFAULT_GROK_BUILD_MODEL = "grok-4.6"
 GROK_BUILD_RUNTIME_ENV = {
@@ -1117,6 +1120,21 @@ def _append_deepseek_codex_config(command: list[str]) -> None:
     command.extend(["-c", 'web_search="disabled"'])
 
 
+def _append_hf_codex_config(command: list[str]) -> None:
+    """Add the fixed, non-secret Codex provider definition for HuggingFace.
+
+    Mirrors the DeepSeek path: the router is OpenAI-compatible, so the codex
+    harness drives it with a fixed base URL and reads the credential from
+    HF_TOKEN (or HUGGINGFACE_API_KEY).
+    """
+
+    command.extend(["-c", 'model_providers.hf.name="HuggingFace"'])
+    command.extend(["-c", f'model_providers.hf.base_url="{HF_CODEX_BASE_URL}"'])
+    command.extend(["-c", 'model_providers.hf.env_key="HF_TOKEN"'])
+    command.extend(["-c", 'model_providers.hf.wire_api="chat"'])
+    command.extend(["-c", 'web_search="disabled"'])
+
+
 def claude_model_provider(
     model: str, env: dict[str, str] | None = None, model_provider: str | None = None
 ) -> str | None:
@@ -1708,6 +1726,8 @@ def codex_exec_command(
         command.extend(["-c", 'model_providers.openrouter.wire_api="responses"'])
     if cli_model_provider == "deepseek":
         _append_deepseek_codex_config(command)
+    if cli_model_provider == "hf":
+        _append_hf_codex_config(command)
     if cli_model_provider:
         command.extend(["-c", f"model_provider={json.dumps(cli_model_provider)}"])
     if thinking_effort and thinking_effort != "default":
