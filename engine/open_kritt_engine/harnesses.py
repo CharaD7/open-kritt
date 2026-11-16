@@ -986,6 +986,12 @@ def _scan_docker_command(
     inherited_env = [
         "CODEX_API_KEY",
         "OPENAI_API_KEY",
+        # Without these the runner has no HuggingFace credential and every hf
+# call fails with auth_failed ("model provider rejected the configured
+# credentials") even though the engine itself has the token.
+        "HF_TOKEN",
+        "HUGGINGFACE_API_KEY",
+        "HF_CODEX_BASE_URL",
         "OPENROUTER_API_KEY",
         "XAI_API_KEY",
         "ANTHROPIC_BASE_URL",
