@@ -6,15 +6,46 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 
-export const PROVIDER_KEYS = ['CODEX_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY'];
+export const PROVIDER_KEYS = [
+  'CODEX_API_KEY',
+  'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'DEEPSEEK_API_KEY',
+  'OPENROUTER_API_KEY',
+  'XAI_API_KEY',
+  'HF_TOKEN',
+  'HUGGINGFACE_API_KEY',
+];
 export const CODEX_LOGIN_STATUS_KEY = 'CODEX_LOGIN_CONFIGURED';
-const MANAGED_PROVIDER_LABELS = {
-  openrouter: 'OpenRouter API key',
+export const MANAGED_PROVIDER_ENV_KEYS = {
+  hf: 'HF_TOKEN',
+  deepseek: 'DEEPSEEK_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
+  xai: 'XAI_API_KEY',
 };
+export const MANAGED_PROVIDER_LABELS = {
+  hf: 'HuggingFace token (Foundation-Sec)',
+  deepseek: 'DeepSeek API key',
+  openrouter: 'OpenRouter API key',
+  xai: 'xAI API key',
+};
+const MANAGED_ENV_KEY_TO_PROVIDER = Object.fromEntries(
+  Object.entries(MANAGED_PROVIDER_ENV_KEYS).map(([provider, key]) => [key, provider])
+);
+
+export function managedProviderForEnvKey(envKey) {
+  return MANAGED_ENV_KEY_TO_PROVIDER[envKey] ?? null;
+}
 const CODEX_LOGIN_CONTAINER_USER_HOME = '/open-kritt-login';
 const CODEX_LOGIN_CONTAINER_HOME = `${CODEX_LOGIN_CONTAINER_USER_HOME}/.codex`;
 const CODEX_LOGIN_CONTAINER_BOOTSTRAP =
   'umask 077; mkdir -p "$HOME" "$CODEX_HOME" && chmod 700 "$HOME" "$CODEX_HOME" && exec codex "$@"';
+const MAX_CAPTURED_OUTPUT = 64 * 1024;
+const DOCKER_PROBE_TIMEOUT_MS = 30_000;
+const DOCKER_INSTALL_HINT = 'Install Docker Desktop, or Docker Engine with the Docker Compose plugin, then try again.';
+
+// `docker compose run --build` backs both guided logins and arrived in Compose 2.13.0.
+export const MINIMUM_COMPOSE_VERSION = '2.13.0';
 
 export const ENVIRONMENT_ITEMS = [
   {
@@ -33,9 +64,24 @@ export const ENVIRONMENT_ITEMS = [
     info: 'Used by the Claude Code harness as an alternative to the guided Claude subscription login.',
   },
   {
+    key: 'HF_TOKEN',
+    label: 'HuggingFace token (Foundation-Sec)',
+    info: 'Used by the Codex harness against the HuggingFace Inference Router. Enables Foundation-Sec, the ChainScope review backend.',
+  },
+  {
+    key: 'DEEPSEEK_API_KEY',
+    label: 'DeepSeek API key',
+    info: 'Used by the Codex harness with models available to the configured DeepSeek account.',
+  },
+  {
     key: 'OPENROUTER_API_KEY',
     label: 'OpenRouter API key',
     info: 'Used for supported OpenRouter-compatible model and harness selections.',
+  },
+  {
+    key: 'XAI_API_KEY',
+    label: 'xAI API key',
+    info: 'Used by the Grok Build harness via the xAI provider.',
   },
   {
     key: 'GITHUB_TOKEN',
@@ -43,6 +89,10 @@ export const ENVIRONMENT_ITEMS = [
     info: 'Optional. It lets the engine clone private GitHub repositories and dependencies. Public and local scans do not need it.',
   },
 ];
+
+export function providerEnvironmentItems() {
+  return ENVIRONMENT_ITEMS.filter((item) => item.key !== 'GITHUB_TOKEN');
+}
 
 export const CODEX_LOGIN = {
   label: 'Codex login',
@@ -349,15 +399,15 @@ function splitConfiguredHomes(value) {
     .filter(Boolean);
 }
 
-export async function updateRuntimeCodexHome(runtimeConfigPath, home, present, initialHomes = []) {
+async function updateRuntimeProviderHome(runtimeConfigPath, key, home, present, initialHomes = []) {
   let text = '';
   try {
     text = await readFile(runtimeConfigPath, 'utf8');
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
-    if (initialHomes.length) text = `ENGINE_CODEX_HOME=${initialHomes.join(',')}\n`;
+    if (initialHomes.length) text = `${key}=${initialHomes.join(',')}\n`;
   }
-  const homes = splitConfiguredHomes(runtimeEnvValue(text, 'ENGINE_CODEX_HOME'));
+  const homes = splitConfiguredHomes(runtimeEnvValue(text, key));
   const nextHomes = present
     ? homes.includes(home)
       ? homes
@@ -366,8 +416,8 @@ export async function updateRuntimeCodexHome(runtimeConfigPath, home, present, i
   if (nextHomes.length === homes.length && nextHomes.every((candidate, index) => candidate === homes[index])) {
     return false;
   }
-  const line = `ENGINE_CODEX_HOME=${nextHomes.join(',')}`;
-  const pattern = /^\s*(?:export\s+)?ENGINE_CODEX_HOME=.*$/m;
+  const line = `${key}=${nextHomes.join(',')}`;
+  const pattern = new RegExp(`^\\s*(?:export\\s+)?${key}=.*$`, 'm');
   const updated = pattern.test(text)
     ? text.replace(pattern, line)
     : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`;
@@ -376,12 +426,34 @@ export async function updateRuntimeCodexHome(runtimeConfigPath, home, present, i
   return true;
 }
 
-async function readRuntimeCodexHomes(runtimeConfigPath) {
+export function updateRuntimeCodexHome(runtimeConfigPath, home, present, initialHomes = []) {
+  return updateRuntimeProviderHome(runtimeConfigPath, 'ENGINE_CODEX_HOME', home, present, initialHomes);
+}
+
+export function updateRuntimeClaudeHome(runtimeConfigPath, home, present, initialHomes = []) {
+  return updateRuntimeProviderHome(runtimeConfigPath, 'ENGINE_CLAUDE_HOME', home, present, initialHomes);
+}
+
+async function readRuntimeHomes(runtimeConfigPath) {
   try {
     const text = await readFile(runtimeConfigPath, 'utf8');
-    return { exists: true, homes: splitConfiguredHomes(runtimeEnvValue(text, 'ENGINE_CODEX_HOME')) };
+    return {
+      exists: true,
+      codexDefined: /^\s*(?:export\s+)?ENGINE_CODEX_HOME=/m.test(text),
+      codexHomes: splitConfiguredHomes(runtimeEnvValue(text, 'ENGINE_CODEX_HOME')),
+      claudeDefined: /^\s*(?:export\s+)?ENGINE_CLAUDE_HOME=/m.test(text),
+      claudeHomes: splitConfiguredHomes(runtimeEnvValue(text, 'ENGINE_CLAUDE_HOME')),
+    };
   } catch (error) {
-    if (error?.code === 'ENOENT') return { exists: false, homes: [] };
+    if (error?.code === 'ENOENT') {
+      return {
+        exists: false,
+        codexDefined: false,
+        codexHomes: [],
+        claudeDefined: false,
+        claudeHomes: [],
+      };
+    }
     throw error;
   }
 }
@@ -425,6 +497,19 @@ function configuredCodexHomes(rootDir, values, homeDir) {
   return homes;
 }
 
+function configuredClaudeHomes(primary, accountsRoot, runtimeHomes) {
+  const homes = [];
+  for (const configured of runtimeHomes) {
+    let hostPath = null;
+    if (configured === '/root/.claude') hostPath = primary;
+    else if (configured.startsWith('/claude-accounts/')) {
+      hostPath = resolve(accountsRoot, configured.slice('/claude-accounts/'.length));
+    }
+    if (hostPath && !homes.includes(hostPath)) homes.push(hostPath);
+  }
+  return homes;
+}
+
 export function resolveHomePath(configuredPath, homeDir = homedir()) {
   const rawPath = configuredPath.trim();
   if (rawPath === '~' || rawPath.startsWith('~/')) return resolve(join(homeDir, rawPath.slice(2)));
@@ -452,16 +537,30 @@ export async function getSetupStatus({ rootDir, envFile = join(rootDir, '.env'),
     engineDataDirectory,
     basename(values.ENGINE_RUNTIME_CONFIG_PATH || 'engine-runtime.env')
   );
-  const runtimeRegistry = await readRuntimeCodexHomes(runtimeConfigPath);
-  const configuredValues = runtimeRegistry.exists
-    ? { ...values, ENGINE_CODEX_HOME: runtimeRegistry.homes.join(',') }
-    : values;
+  const runtimeRegistry = await readRuntimeHomes(runtimeConfigPath);
+  const configuredValues =
+    runtimeRegistry.exists && runtimeRegistry.codexDefined
+      ? { ...values, ENGINE_CODEX_HOME: runtimeRegistry.codexHomes.join(',') }
+      : values;
   const codexHomes = configuredCodexHomes(rootDir, configuredValues, homeDir);
   if (!codexHomes.includes(codexHome)) codexHomes.push(codexHome);
-  const runtimeCodexHomes = runtimeRegistry.exists
-    ? runtimeRegistry.homes
-    : splitConfiguredHomes(values.ENGINE_CODEX_HOME || '/root/.codex');
-  const claudeHome = resolveProjectPath(rootDir, values.ENGINE_CLAUDE_HOME || './.data/claude', homeDir);
+  const runtimeCodexHomes =
+    runtimeRegistry.exists && runtimeRegistry.codexDefined
+      ? runtimeRegistry.codexHomes
+      : splitConfiguredHomes(values.ENGINE_CODEX_HOME || '/root/.codex');
+  const claudeHome = resolveProjectPath(
+    rootDir,
+    values.ENGINE_CLAUDE_HOME_HOST || values.ENGINE_CLAUDE_HOME || './.data/claude',
+    homeDir
+  );
+  const claudeAccountsRoot = resolveProjectPath(
+    rootDir,
+    values.ENGINE_CLAUDE_ACCOUNTS_HOST || './.data/claude-accounts',
+    homeDir
+  );
+  const runtimeClaudeHomes =
+    runtimeRegistry.exists && runtimeRegistry.claudeDefined ? runtimeRegistry.claudeHomes : ['/root/.claude'];
+  const claudeHomes = configuredClaudeHomes(claudeHome, claudeAccountsRoot, runtimeClaudeHomes);
   const credentialsDirectory = resolveProjectPath(
     rootDir,
     values.ENGINE_CREDENTIALS_HOST || './.data/engine/credentials',
@@ -471,10 +570,10 @@ export async function getSetupStatus({ rootDir, envFile = join(rootDir, '.env'),
   const managedState = await managedProviderState(credentialsPath);
   const disabledProviders = managedState.disabledEnvironmentProviders;
   const valuesPresent = Object.fromEntries(
-    ENVIRONMENT_ITEMS.map(({ key }) => [
-      key,
-      Boolean(values[key]) && !(key === 'OPENROUTER_API_KEY' && disabledProviders.includes('openrouter')),
-    ])
+    ENVIRONMENT_ITEMS.map(({ key }) => {
+      const provider = managedProviderForEnvKey(key);
+      return [key, Boolean(values[key]) && !(provider && disabledProviders.includes(provider))];
+    })
   );
   const codexAuthInspections = await Promise.all(
     codexHomes.map((home) => inspectCodexAuthFile(join(home, 'auth.json')))
@@ -484,7 +583,7 @@ export async function getSetupStatus({ rootDir, envFile = join(rootDir, '.env'),
   const codexLoginIssue = codexLoginPresent
     ? null
     : codexAuthInspections.find((inspection) => inspection.issue !== 'missing')?.issue || null;
-  const claudeLoginPresent = await usableClaudeLogin(claudeHome);
+  const claudeLoginPresent = (await Promise.all(claudeHomes.map((home) => usableClaudeLogin(home)))).some(Boolean);
   const managedProviders = Object.keys(managedState.credentials);
   const providerPresent =
     PROVIDER_KEYS.some((key) => valuesPresent[key]) ||
@@ -502,10 +601,13 @@ export async function getSetupStatus({ rootDir, envFile = join(rootDir, '.env'),
     codexLoginPresent,
     primaryCodexLoginPresent,
     claudeHome,
+    claudeAccountsRoot,
+    claudeHomes,
     claudeLoginPresent,
     credentialsPath,
     runtimeConfigPath,
     runtimeCodexHomes,
+    runtimeClaudeHomes,
     runtimeRegistryExists: runtimeRegistry.exists,
     disabledProviders,
     envExists,
@@ -583,6 +685,25 @@ export async function syncCodexLoginStatus({
   return envChanged ? getSetupStatus({ rootDir, envFile, homeDir }) : status;
 }
 
+export async function syncClaudeLoginStatus({
+  rootDir = process.cwd(),
+  envFile = join(rootDir, '.env'),
+  homeDir = homedir(),
+} = {}) {
+  let status = await getSetupStatus({ rootDir, envFile, homeDir });
+  if (!status.envExists || !status.runtimeRegistryExists) return status;
+
+  const primaryPresent = await usableClaudeLogin(status.claudeHome);
+  await updateRuntimeClaudeHome(status.runtimeConfigPath, '/root/.claude', primaryPresent, status.runtimeClaudeHomes);
+  status = await getSetupStatus({ rootDir, envFile, homeDir });
+  return status;
+}
+
+async function syncProviderLoginStatus(context) {
+  await syncCodexLoginStatus(context);
+  return syncClaudeLoginStatus(context);
+}
+
 function renderStatus(status, io) {
   write(io, '\nCredential status');
   const codexStatus = status.codexLoginPresent
@@ -597,7 +718,7 @@ function renderStatus(status, io) {
     io,
     `${status.claudeLoginPresent ? '✓' : '○'} Claude login ${status.claudeLoginPresent ? 'present' : 'not set'}`
   );
-  for (const item of ENVIRONMENT_ITEMS.slice(0, 4)) {
+  for (const item of providerEnvironmentItems()) {
     const present = status.valuesPresent[item.key];
     write(io, `${present ? '✓' : '○'} ${item.label} ${present ? 'present' : 'not set'}`);
   }
@@ -625,8 +746,16 @@ async function askLine(question, io) {
 }
 
 async function askSecret(question, io) {
+  // Some interactive terminals — notably Git Bash / MSYS on Windows — expose a
+  // stdin whose isTTY is undefined and cannot enter raw mode. Rather than crashing
+  // setup (issue #55), offer a visible line prompt as an explicit opt-in fallback.
   if (!io.input.isTTY || typeof io.input.setRawMode !== 'function') {
-    throw new Error('Secret entry requires an interactive terminal.');
+    write(io, 'Warning: this terminal cannot hide input; the value will be visible as you type.');
+    const consent = await askLine('Continue with visible input? [y/N] ', io);
+    if (!/^(y|yes)$/i.test(consent)) return '';
+
+    const visibleQuestion = question.replace(/input is hidden/i, 'input will be visible');
+    return askLine(visibleQuestion, io);
   }
 
   io.output.write(question);
@@ -663,7 +792,7 @@ async function askSecret(question, io) {
   });
 }
 
-function createPrompter(io) {
+export function createPrompter(io) {
   return {
     ask: (question) => askLine(question, io),
     secret: (question) => askSecret(question, io),
@@ -676,7 +805,41 @@ function createPrompter(io) {
 
 export async function runCommand(command, args, options = {}) {
   return new Promise((resolveCommand, rejectCommand) => {
-    const child = spawn(command, args, { cwd: options.cwd, stdio: options.stdio || 'inherit' });
+    const timeoutMs = options.timeoutMs ?? 0;
+    const isolatedProcessGroup = timeoutMs > 0 && process.platform !== 'win32';
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: options.stdio || 'inherit',
+      detached: isolatedProcessGroup,
+    });
+    let timedOut = false;
+    // Only bounded diagnostic commands opt in; interactive operations have no timer.
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            if (isolatedProcessGroup && child.pid) {
+              try {
+                process.kill(-child.pid, 'SIGKILL');
+              } catch {
+                child.kill('SIGKILL');
+              }
+            } else {
+              child.kill('SIGKILL');
+            }
+          }, timeoutMs)
+        : null;
+    const captured = { stdout: '', stderr: '' };
+    const capture = (stream, key) => {
+      if (!stream) return;
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        if (captured[key].length >= MAX_CAPTURED_OUTPUT) return;
+        captured[key] = `${captured[key]}${chunk}`.slice(0, MAX_CAPTURED_OUTPUT);
+      });
+    };
+    capture(child.stdout, 'stdout');
+    capture(child.stderr, 'stderr');
     const abortSignal = options.signal;
     const removeAbortListener = () => abortSignal?.removeEventListener('abort', onAbort);
     const onAbort = () => {
@@ -686,12 +849,14 @@ export async function runCommand(command, args, options = {}) {
     abortSignal?.addEventListener('abort', onAbort, { once: true });
     if (abortSignal?.aborted) onAbort();
     child.once('error', (error) => {
+      clearTimeout(timer);
       removeAbortListener();
       rejectCommand(new CommandError(command, error));
     });
     child.once('close', (code, signal) => {
+      clearTimeout(timer);
       removeAbortListener();
-      resolveCommand({ code: code ?? 1, signal });
+      resolveCommand({ code: code ?? 1, signal, timedOut, ...captured });
     });
   });
 }
@@ -715,17 +880,19 @@ async function manageEnvironmentItem(context, item) {
       write(io, 'Nothing changed.');
       return;
     }
-    if (item.key === 'OPENROUTER_API_KEY') {
+    const managedProvider = managedProviderForEnvKey(item.key);
+    if (managedProvider) {
       const status = await getSetupStatus(context);
-      await saveManagedProviderCredential(status.credentialsPath, 'openrouter', value);
+      await saveManagedProviderCredential(status.credentialsPath, managedProvider, value);
     }
     await setEnvValue(envFile, item.key, value);
     write(io, `${item.label} saved.`);
   } else if (action === '2') {
     if (await prompter.confirm(`Unset ${item.label}?`)) {
-      if (item.key === 'OPENROUTER_API_KEY') {
+      const managedProvider = managedProviderForEnvKey(item.key);
+      if (managedProvider) {
         const status = await getSetupStatus(context);
-        await disableManagedProviderCredential(status.credentialsPath, 'openrouter');
+        await disableManagedProviderCredential(status.credentialsPath, managedProvider);
       }
       await setEnvValue(envFile, item.key, '');
       write(io, `${item.label} unset.`);
@@ -845,7 +1012,129 @@ async function removeLoginContainer(runner, rootDir, containerName, io) {
   }
 }
 
+function versionNumbers(text) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(text || '');
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+function isOlderVersion(candidate, minimum) {
+  for (let index = 0; index < minimum.length; index += 1) {
+    const left = candidate[index] ?? 0;
+    const right = minimum[index] ?? 0;
+    if (left !== right) return left < right;
+  }
+  return false;
+}
+
+function firstLine(text) {
+  return (text || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+}
+
+/**
+ * Verifies the Docker environment this project actually needs: a reachable daemon, a
+ * Compose plugin new enough for the flags the CLI passes, and a Compose project the
+ * plugin can parse. Without it, an old or stopped Docker surfaces as an unexplained
+ * login or startup failure.
+ */
+export async function checkDockerEnvironment({ rootDir, runner = runCommand } = {}) {
+  const issues = [];
+  const probe = async (args) => {
+    const result = await runner('docker', args, {
+      cwd: rootDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeoutMs: DOCKER_PROBE_TIMEOUT_MS,
+    });
+    if (result.timedOut) {
+      const error = new Error('Docker diagnostic timed out.');
+      error.code = 'docker_timeout';
+      throw error;
+    }
+    return result;
+  };
+  let serverVersion = null;
+  let composeVersion = null;
+
+  try {
+    const daemon = await probe(['version', '--format', '{{.Server.Version}}']);
+    const daemonVersion = firstLine(daemon.stdout);
+    serverVersion = daemon.code === 0 && versionNumbers(daemonVersion) ? daemonVersion : null;
+    if (daemon.code !== 0) {
+      issues.push({
+        code: 'daemon_unreachable',
+        message:
+          'The Docker daemon is not reachable. Start Docker Desktop or the docker service, and check "docker context ls" when more than one Docker is installed.',
+      });
+    }
+
+    const compose = await probe(['compose', 'version', '--short']);
+    if (compose.code !== 0) {
+      issues.push({
+        code: 'compose_missing',
+        message: `The Docker Compose plugin is not available. ${DOCKER_INSTALL_HINT}`,
+      });
+      return { ok: false, issues, serverVersion, composeVersion };
+    }
+
+    const rawVersion = (compose.stdout || '').trim();
+    const numbers = versionNumbers(rawVersion);
+    if (!numbers) {
+      issues.push({
+        code: 'compose_version_unknown',
+        message:
+          'The Docker Compose version could not be verified. Check "docker compose version" locally, update Docker Compose, then try again.',
+      });
+      return { ok: false, issues, serverVersion, composeVersion };
+    }
+    composeVersion = rawVersion.replace(/^v/, '');
+    if (isOlderVersion(numbers, versionNumbers(MINIMUM_COMPOSE_VERSION))) {
+      issues.push({
+        code: 'compose_outdated',
+        message: `Docker Compose ${composeVersion} is too old for open-kritt, which needs ${MINIMUM_COMPOSE_VERSION} or newer: the guided logins run "docker compose run --build". Update Docker, then try again.`,
+      });
+      return { ok: false, issues, serverVersion, composeVersion };
+    }
+
+    const project = await probe(['compose', 'config', '-q']);
+    if (project.code !== 0) {
+      issues.push({
+        code: 'project_invalid',
+        message:
+          'Docker Compose could not read this project. Update Docker Compose to a current release, or inspect docker-compose.yml and .env locally, then try again.',
+      });
+    }
+  } catch (error) {
+    issues.push(
+      error?.code === 'docker_timeout'
+        ? {
+            code: 'docker_timeout',
+            message:
+              'A Docker diagnostic did not finish within 30 seconds. Check Docker and the selected context locally, then try again.',
+          }
+        : { code: 'docker_missing', message: `Docker could not be started. ${DOCKER_INSTALL_HINT}` }
+    );
+  }
+
+  return { ok: issues.length === 0, issues, serverVersion, composeVersion };
+}
+
+export function dockerEnvironmentMessage(preflight) {
+  return preflight.issues.map((issue) => issue.message).join(' ');
+}
+
+async function dockerEnvironmentBlocked({ io, rootDir, runner }) {
+  const preflight = await checkDockerEnvironment({ rootDir, runner });
+  if (preflight.ok) return null;
+  for (const issue of preflight.issues) writeError(io, issue.message);
+  return preflight;
+}
+
 export async function saveDockerCodexLogin({ io, rootDir, runner = runCommand, signalSource = process, targetPath }) {
+  const blocked = await dockerEnvironmentBlocked({ io, rootDir, runner });
+  if (blocked) return failedAuthResult('docker_unavailable', dockerEnvironmentMessage(blocked));
+
   const directoryResult = await ensureCodexHomeDirectory(dirname(targetPath), rootDir);
   if (!directoryResult.ok) {
     writeError(io, directoryResult.message);
@@ -952,6 +1241,8 @@ export async function saveDockerCodexLogin({ io, rootDir, runner = runCommand, s
 }
 
 export async function saveDockerClaudeLogin({ io, rootDir, runner = runCommand, home }) {
+  if (await dockerEnvironmentBlocked({ io, rootDir, runner })) return false;
+
   await mkdir(home, { recursive: true, mode: 0o700 });
   write(
     io,
@@ -1033,8 +1324,7 @@ async function manageCodexLogin(context) {
       if (result.ok) {
         await syncCodexLoginStatus(context);
         write(io, result.message);
-      }
-      else writeError(io, result.message);
+      } else writeError(io, result.message);
     }
   } else if (action === '4') {
     write(io, itemInfo(CODEX_LOGIN));
@@ -1045,7 +1335,7 @@ async function manageCodexLogin(context) {
 
 async function manageClaudeLogin(context) {
   const { io, prompter } = context;
-  const status = await getSetupStatus(context);
+  const status = await syncClaudeLoginStatus(context);
   write(io, '\nClaude login');
   write(io, '1) Sign in with Docker');
   write(io, '2) Remove the saved login');
@@ -1060,9 +1350,11 @@ async function manageClaudeLogin(context) {
       runner: context.runner,
       home: status.claudeHome,
     });
+    await syncClaudeLoginStatus(context);
   } else if (action === '2') {
     if (await prompter.confirm('Remove the saved Claude login for this project?')) {
       await removeClaudeAuth(status.claudeHome);
+      await syncClaudeLoginStatus(context);
       write(io, 'Saved Claude login removed.');
     }
   } else if (action === '3') {
@@ -1099,12 +1391,14 @@ export async function runSetup(options = {}) {
     write(context.io, '3) Codex API key');
     write(context.io, '4) OpenAI API key');
     write(context.io, '5) Anthropic API key');
-    write(context.io, '6) OpenRouter API key');
-    write(context.io, '7) GitHub token');
-    write(context.io, '8) Finish setup');
+    write(context.io, '6) DeepSeek API key');
+    write(context.io, '7) OpenRouter API key');
+    write(context.io, '8) xAI API key');
+    write(context.io, '9) GitHub token');
+    write(context.io, '10) Finish setup');
     const choice = (await context.prompter.ask('Choose an item: ')).toLowerCase();
 
-    if (choice === '8' || choice === 'q' || choice === 'quit') break;
+    if (choice === '10' || choice === 'q' || choice === 'quit') break;
     if (choice === '1') {
       await manageCodexLogin(context);
       continue;
@@ -1113,7 +1407,11 @@ export async function runSetup(options = {}) {
       await manageClaudeLogin(context);
       continue;
     }
-    const item = ENVIRONMENT_ITEMS[Number(choice) - 3] || (choice === '7' ? ENVIRONMENT_ITEMS[4] : null);
+    const providerItems = providerEnvironmentItems();
+    const githubChoice = String(providerItems.length + 3);
+    const item =
+      providerItems[Number(choice) - 3] ||
+      (choice === githubChoice ? ENVIRONMENT_ITEMS.find((candidate) => candidate.key === 'GITHUB_TOKEN') : null);
     if (!item) {
       write(context.io, 'Choose a listed item.');
       continue;
@@ -1121,7 +1419,7 @@ export async function runSetup(options = {}) {
     await manageEnvironmentItem(context, item);
   }
 
-  const status = await syncCodexLoginStatus(context);
+  const status = await syncProviderLoginStatus(context);
   if (status.providerPresent) write(context.io, 'Setup complete. Run ./kritt start when you are ready.');
   else write(context.io, 'Setup saved. Add one provider key or a Codex or Claude login before running ./kritt start.');
   return 0;
@@ -1134,7 +1432,7 @@ export async function runStart(options = {}) {
     return 1;
   }
 
-  const status = await syncCodexLoginStatus(context);
+  const status = await syncProviderLoginStatus(context);
   if (!status.providerPresent) {
     if (status.codexLoginIssue === 'permission') {
       writeError(context.io, await codexHomePermissionMessage(status.codexHome, context.rootDir));
@@ -1153,6 +1451,8 @@ export async function runStart(options = {}) {
     writeError(context.io, directoryResult.message);
     return 1;
   }
+
+  if (await dockerEnvironmentBlocked(context)) return 1;
 
   write(context.io, 'Starting open-kritt. Press Ctrl+C to stop the stack.');
   try {
@@ -1182,14 +1482,14 @@ Creates .env from .env.example when it does not exist, shows credential status, 
 
 Configure one model provider key or a saved Codex or Claude login. GITHUB_TOKEN is optional and only needed for private GitHub repositories.
 
-The Codex and Claude login flows use temporary engine containers and persist their provider credentials in the same homes monitored by Accounts. OpenRouter keys are saved in .env and mirrored to the managed credential store used by running services.
+The Codex and Claude login flows use temporary engine containers and persist their provider credentials in the same homes monitored by Accounts. Both check first that Docker is running, that the Docker Compose plugin is ${MINIMUM_COMPOSE_VERSION} or newer, and that Compose can read this project, so an unusable Docker is reported instead of an empty login. OpenRouter keys are saved in .env and mirrored to the managed credential store used by running services.
 
 The recommended Codex flow uses device authentication (no localhost callback) and saves auth.json with host-user ownership and private permissions.
 
 Run ./kritt as your normal user, not with sudo. Use Import local login instead of copying auth.json by hand.`,
   start: `Usage: ./kritt start
 
-Checks that .env and at least one model provider credential or Codex login are configured, then runs:
+Checks that .env and at least one model provider credential or Codex login are configured, that the Docker daemon is reachable, that the Docker Compose plugin is ${MINIMUM_COMPOSE_VERSION} or newer, and that Compose can read this project, then runs:
 
   docker compose up --build
 

@@ -178,6 +178,7 @@ TOOL_FREE_CODEX_DISABLED_FEATURES = (
     "apps",
     "multi_agent",
     "computer_use",
+    "web_search",
 )
 
 OPENROUTER_CLAUDE_BASE_URL = "https://openrouter.ai/api"
@@ -1131,7 +1132,7 @@ def _append_hf_codex_config(command: list[str]) -> None:
     command.extend(["-c", 'model_providers.hf.name="HuggingFace"'])
     command.extend(["-c", f'model_providers.hf.base_url="{HF_CODEX_BASE_URL}"'])
     command.extend(["-c", 'model_providers.hf.env_key="HF_TOKEN"'])
-    command.extend(["-c", 'model_providers.hf.wire_api="chat"'])
+    command.extend(["-c", 'model_providers.hf.wire_api="responses"'])
     command.extend(["-c", 'web_search="disabled"'])
 
 
@@ -1715,6 +1716,12 @@ def codex_exec_command(
         )
         for feature in TOOL_FREE_CODEX_DISABLED_FEATURES:
             command.extend(["--disable", feature])
+        if cli_model_provider == "hf":
+            # The HF router's Responses compatibility layer rejects codex's
+            # namespace/web_search tool entries, so no MCP or built-in tools
+            # may be advertised at all.
+            command.extend(["--disable", "mcp"])
+            command.extend(["--disable", "view_image"])
     command.extend(["--output-schema", schema_path, "-o", output_path])
     if not allow_tools and cli_model_provider == "openrouter":
         # `--ignore-user-config` removes custom providers along with user
