@@ -6,13 +6,19 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from open_kritt_engine import model_catalog
 from open_kritt_engine.model_catalog import (
     ModelCatalogRefresher,
     codex_is_configured,
     fetch_anthropic_models,
     fetch_codex_models,
+    fetch_deepseek_models,
+    fetch_hf_models,
     fetch_openrouter_models,
+    fetch_xai_models,
+    model_supports_service_tier,
     normalize_catalog_models,
 )
 
@@ -98,6 +104,12 @@ def test_normalize_catalog_models_prefers_cli_model_and_sanitizes_metadata():
                 "id": "internal-id",
                 "model": "gpt-5-codex",
                 "displayName": "GPT-5 Codex",
+                "serviceTiers": [
+                    {"id": "fast", "name": "Fast"},
+                    {"id": "fast", "name": "Duplicate"},
+                    {"id": "flex", "name": "Flex"},
+                    {"id": "\ninvalid"},
+                ],
                 "supportedReasoningEfforts": [
                     {"reasoningEffort": "low"},
                     {"reasoningEffort": "medium"},
@@ -119,6 +131,7 @@ def test_normalize_catalog_models_prefers_cli_model_and_sanitizes_metadata():
             "label": "GPT-5 Codex",
             "thinkingEfforts": ["low", "medium", "max", "ultra"],
             "isDefault": False,
+            "serviceTiers": ["fast", "flex"],
         },
         {
             "id": "claude-sonnet-4",
@@ -128,6 +141,17 @@ def test_normalize_catalog_models_prefers_cli_model_and_sanitizes_metadata():
         },
     ]
     assert default_model == "claude-sonnet-4"
+
+
+def test_model_service_tier_support_requires_an_exact_catalog_advertisement():
+    models = [
+        {"id": "gpt-fast", "serviceTiers": ["fast"]},
+        {"id": "gpt-standard"},
+    ]
+
+    assert model_supports_service_tier(models, "gpt-fast", "fast") is True
+    assert model_supports_service_tier(models, "gpt-standard", "fast") is False
+    assert model_supports_service_tier(models, "unknown", "fast") is False
 
 
 def test_normalize_catalog_models_adds_cyber_note_to_gpt_models_newer_than_5_4():
@@ -245,6 +269,7 @@ def test_fetch_anthropic_models_uses_the_account_model_list(monkeypatch):
                 {
                     "data": [
                         {"id": "claude-fable-5", "display_name": "Claude Fable 5"},
+                        {"id": "claude-opus-5", "display_name": "Claude Opus 5"},
                         {"id": "claude-opus-4-6", "display_name": "Claude Opus 4.6"},
                         {"id": "claude-haiku-4", "display_name": "Claude Haiku 4"},
                     ],
@@ -256,12 +281,18 @@ def test_fetch_anthropic_models_uses_the_account_model_list(monkeypatch):
     monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
     models, default_model = fetch_anthropic_models("anthropic-test-key", 2)
 
-    assert [model["id"] for model in models] == ["claude-fable-5", "claude-opus-4-6", "claude-haiku-4"]
+    assert [model["id"] for model in models] == [
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-opus-4-6",
+        "claude-haiku-4",
+    ]
     assert models[0]["label"] == "Claude Fable 5"
     assert models[0]["note"] == "Cyber requests may route to Opus 4.8."
     assert models[0]["thinkingEfforts"] == ["low", "medium", "high", "xhigh", "max"]
-    assert models[1]["thinkingEfforts"] == ["low", "medium", "high", "max"]
-    assert models[2]["thinkingEfforts"] == ["default"]
+    assert models[1]["thinkingEfforts"] == ["low", "medium", "high", "xhigh", "max"]
+    assert models[2]["thinkingEfforts"] == ["low", "medium", "high", "max"]
+    assert models[3]["thinkingEfforts"] == ["default"]
     assert default_model == "claude-fable-5"
     request, timeout = requests[0]
     assert request.full_url == "https://api.anthropic.com/v1/models?limit=100"
@@ -269,61 +300,121 @@ def test_fetch_anthropic_models_uses_the_account_model_list(monkeypatch):
     assert timeout > 0
 
 
-def test_fetch_openrouter_models_keeps_ten_popular_code_and_security_suggestions(monkeypatch):
+def _openrouter_model(model_id, *, name=None, output_modalities=None, reasoning=None):
+    return {
+        "id": model_id,
+        "name": name or model_id,
+        "architecture": {"output_modalities": output_modalities or ["text"]},
+        **({"reasoning": reasoning} if reasoning is not None else {}),
+    }
+
+
+def test_fetch_deepseek_models_uses_account_catalog_and_supported_efforts(monkeypatch):
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "deepseek-v4-pro"},
+                        {"id": "deepseek-flash"},
+                        {"id": "deepseek-flash"},
+                        {"id": ""},
+                    ]
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
+    models, default_model = fetch_deepseek_models("deepseek-test-key", 2)
+
+    assert [model["id"] for model in models] == ["deepseek-v4-pro", "deepseek-flash"]
+    assert models[0]["thinkingEfforts"] == ["low", "high", "max"]
+    assert models[1]["isDefault"] is True
+    assert default_model == "deepseek-flash"
+    request, timeout = requests[0]
+    assert request.full_url == "https://api.deepseek.com/models"
+    assert request.get_header("Authorization") == "Bearer deepseek-test-key"
+    assert timeout == 2
+
+
+def test_fetch_openrouter_models_uses_account_catalog_and_keeps_all_text_models(monkeypatch):
     requests = []
 
     def fake_urlopen(request, timeout):
         requests.append((request, timeout))
         entries = [
-            {
-                "id": f"vendor/code-model-{index}",
-                "name": f"Code Model {index}",
-                "description": "Coding and software engineering model",
-                "supported_parameters": ["reasoning", "tools"],
-                "reasoning": {"supported_efforts": ["high", "minimal", "medium", "low"]},
-            }
-            for index in range(12)
+            _openrouter_model("vendor/general-chat", name="General Chat"),
+            _openrouter_model("openai/gpt-model", name="OpenAI through OpenRouter"),
+            _openrouter_model("z-ai/glm-5.2", name=" Z.ai GLM 5.2 "),
+            _openrouter_model("anthropic/claude-model", name="Claude through OpenRouter"),
+            _openrouter_model("vendor/image-only", output_modalities=["image"]),
+            _openrouter_model(
+                "vendor/reasoning-model",
+                reasoning={"supported_efforts": ["high", "minimal", "medium", "low"]},
+            ),
         ]
-        entries.insert(
-            0,
-            {
-                "id": "vendor/general-chat",
-                "name": "General Chat",
-                "description": "General conversation",
-                "supported_parameters": ["tools"],
-            },
-        )
         return io.BytesIO(json.dumps({"data": entries}).encode("utf-8"))
 
     monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
     models, default_model = fetch_openrouter_models("openrouter-test-key", 2)
 
-    assert len(models) == 10
-    assert models[0]["id"] == "vendor/code-model-0"
-    assert models[0]["thinkingEfforts"] == ["low", "medium", "high"]
-    assert default_model == "vendor/code-model-0"
+    assert [model["id"] for model in models] == [
+        "vendor/general-chat",
+        "openai/gpt-model",
+        "z-ai/glm-5.2",
+        "anthropic/claude-model",
+        "vendor/reasoning-model",
+    ]
+    assert models[2]["label"] == "Z.ai GLM 5.2"
+    assert models[2]["isDefault"] is True
+    assert models[4]["thinkingEfforts"] == ["low", "medium", "high"]
+    assert default_model == "z-ai/glm-5.2"
     request, timeout = requests[0]
-    assert request.full_url == "https://openrouter.ai/api/v1/models?sort=most-popular"
+    assert request.full_url == "https://openrouter.ai/api/v1/models/user"
     assert request.get_header("Authorization") == "Bearer openrouter-test-key"
     assert timeout == 2
 
 
+def test_fetch_openrouter_models_pins_ox_alpha_thinking_efforts(monkeypatch):
+    entries = [
+        _openrouter_model("z-ai/glm-5.2", name="Z.ai GLM 5.2"),
+        _openrouter_model(
+            "stealth/ox-alpha",
+            name="Ox Alpha",
+            reasoning={"mandatory": True, "supported_efforts": ["low", "high"]},
+        ),
+    ]
+    monkeypatch.setattr(
+        model_catalog,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(json.dumps({"data": entries}).encode("utf-8")),
+    )
+
+    models, _default_model = fetch_openrouter_models("openrouter-test-key", 2)
+
+    assert models[1] == {
+        "id": "stealth/ox-alpha",
+        "label": "Ox Alpha",
+        "thinkingEfforts": ["low", "high", "max"],
+        "isDefault": False,
+    }
+
+
 def test_fetch_openrouter_models_uses_provider_default_or_all_gateway_efforts(monkeypatch):
     entries = [
-        {
-            "id": "vendor/default-reasoning-model",
-            "name": "Default Reasoning Model",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning"],
-            "reasoning": {"mandatory": True},
-        },
-        {
-            "id": "vendor/gateway-effort-model",
-            "name": "Gateway Effort Model",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning", "reasoning_effort"],
-            "reasoning": {"supported_efforts": None},
-        },
+        _openrouter_model(
+            "vendor/default-reasoning-model",
+            name="Default Reasoning Model",
+            reasoning={"mandatory": True},
+        ),
+        _openrouter_model(
+            "vendor/gateway-effort-model",
+            name="Gateway Effort Model",
+            reasoning={"supported_efforts": None},
+        ),
     ]
     monkeypatch.setattr(
         model_catalog,
@@ -337,79 +428,83 @@ def test_fetch_openrouter_models_uses_provider_default_or_all_gateway_efforts(mo
     assert models[1]["thinkingEfforts"] == ["low", "medium", "high", "xhigh", "max"]
 
 
-def test_fetch_openrouter_models_features_glm_kimi_and_sakana_without_anthropic_or_openai(monkeypatch):
-    featured = [
-        {
-            "id": "anthropic/claude-opus-latest",
-            "name": "Claude Opus",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning"],
-        },
-        {
-            "id": "openai/gpt-latest",
-            "name": "GPT Latest",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning"],
-        },
-        {
-            "id": "sakana/fugu-ultra",
-            "name": "Sakana: Fugu Ultra",
-            "description": "Coding and agentic workflows",
-            "supported_parameters": ["reasoning_effort"],
-        },
-        {
-            "id": "moonshotai/kimi-k2.7-code",
-            "name": "MoonshotAI: Kimi K2.7 Code",
-            "description": "Coding-focused model",
-            "supported_parameters": ["reasoning"],
-        },
-        {
-            "id": "z-ai/glm-5.2",
-            "name": "Z.ai: GLM 5.2",
-            "description": "Project-level software engineering",
-            "supported_parameters": ["reasoning_effort"],
-        },
-        {
-            "id": "moonshotai/kimi-k2.6",
-            "name": "MoonshotAI: Kimi K2.6",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning"],
-        },
-        {
-            "id": "z-ai/glm-5.1",
-            "name": "Z.ai: GLM 5.1",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning"],
-        },
+def test_fetch_openrouter_models_caps_the_sanitized_catalog(monkeypatch):
+    entries = [
+        _openrouter_model(f"vendor/model-{index}", name=f"Model {index}")
+        for index in range(model_catalog.MAX_CATALOG_MODELS + 25)
     ]
-    featured.extend(
-        {
-            "id": f"vendor/code-model-{index}",
-            "name": f"Code Model {index}",
-            "description": "Coding model",
-            "supported_parameters": ["reasoning"],
-        }
-        for index in range(10)
-    )
-
+    entries.append(_openrouter_model("z-ai/glm-5.2", name="Preferred Default"))
     monkeypatch.setattr(
         model_catalog,
         "urlopen",
-        lambda *_args, **_kwargs: io.BytesIO(json.dumps({"data": featured}).encode("utf-8")),
+        lambda *_args, **_kwargs: io.BytesIO(json.dumps({"data": entries}).encode("utf-8")),
     )
     models, default_model = fetch_openrouter_models("openrouter-test-key", 2)
 
-    assert [model["id"] for model in models[:3]] == [
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "sakana/fugu-ultra",
-    ]
-    assert len(models) == 10
+    assert len(models) == model_catalog.MAX_CATALOG_MODELS
+    assert models[0]["id"] == "vendor/model-0"
+    assert models[-1]["id"] == "z-ai/glm-5.2"
     assert default_model == "z-ai/glm-5.2"
-    assert models[2]["label"] == "Sakana: Fugu Ultra — expensive"
-    assert not any(model["id"].startswith(("anthropic/", "openai/")) for model in models)
-    assert "moonshotai/kimi-k2.6" not in {model["id"] for model in models}
-    assert "z-ai/glm-5.1" not in {model["id"] for model in models}
+
+
+def test_fetch_openrouter_models_rejects_oversized_or_invalid_responses(monkeypatch):
+    monkeypatch.setattr(model_catalog, "MAX_HTTP_CATALOG_BYTES", 32)
+    monkeypatch.setattr(
+        model_catalog,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(b'{"data":[{"id":"vendor/model","padding":"too large"}]}'),
+    )
+    with pytest.raises(model_catalog.ModelCatalogError, match="response was too large"):
+        fetch_openrouter_models("openrouter-test-key", 2)
+
+    monkeypatch.setattr(model_catalog, "MAX_HTTP_CATALOG_BYTES", 1024)
+    monkeypatch.setattr(model_catalog, "urlopen", lambda *_args, **_kwargs: io.BytesIO(b"not-json"))
+    with pytest.raises(model_catalog.ModelCatalogError, match="Could not read the OpenRouter model catalog"):
+        fetch_openrouter_models("openrouter-test-key", 2)
+
+
+def test_fetch_xai_models_uses_language_endpoint_and_model_efforts(monkeypatch):
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "models": [
+                        {"id": "grok-3", "name": "Grok 3", "output_modalities": ["text"]},
+                        {"id": "grok-4.5", "name": "Grok 4.5", "output_modalities": ["text"]},
+                        {"id": "grok-4.6", "name": "Grok 4.6", "output_modalities": ["text"]},
+                        {"id": "grok-code-fast-1", "name": "Grok Code Fast"},
+                        {"id": "grok-imagine-image", "output_modalities": ["image"]},
+                    ]
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
+    models, default_model = fetch_xai_models("xai-test-key", 2)
+
+    assert [model["id"] for model in models] == ["grok-3", "grok-4.5", "grok-4.6", "grok-code-fast-1"]
+    assert default_model == "grok-4.6"
+    assert models[2]["isDefault"] is True
+    assert models[1]["thinkingEfforts"] == ["low", "medium", "high"]
+    assert models[2]["thinkingEfforts"] == ["low", "medium", "high", "xhigh"]
+    request, timeout = requests[0]
+    assert request.full_url == "https://api.x.ai/v1/language-models"
+    assert request.get_header("Authorization") == "Bearer xai-test-key"
+    assert timeout == 2
+
+
+def test_fetch_xai_models_injects_default_when_missing(monkeypatch):
+    monkeypatch.setattr(
+        model_catalog,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(json.dumps({"models": [{"id": "grok-3"}]}).encode("utf-8")),
+    )
+    models, default_model = fetch_xai_models("xai-test-key", 2)
+    assert default_model == "grok-4.6"
+    assert any(model["id"] == "grok-4.6" and model["isDefault"] for model in models)
 
 
 def test_refresher_persists_only_configured_provider_catalogs():
@@ -419,26 +514,49 @@ def test_refresher_persists_only_configured_provider_catalogs():
     openrouter_models = [
         {"id": "vendor/code-model", "label": "Code Model", "thinkingEfforts": ["medium"], "isDefault": True}
     ]
+    xai_models = [
+        {"id": "grok-4.5", "label": "Grok 4.5", "thinkingEfforts": ["low", "medium", "high"], "isDefault": True}
+    ]
+    deepseek_models = [
+        {
+            "id": "deepseek-flash",
+            "label": "deepseek-flash",
+            "thinkingEfforts": ["low", "high", "max"],
+            "isDefault": True,
+        }
+    ]
     refresher = ModelCatalogRefresher(
         db,
         env={
             "CODEX_API_KEY": "codex-key",
             "ANTHROPIC_API_KEY": "anthropic-key",
+            "DEEPSEEK_API_KEY": "deepseek-key",
             "OPENROUTER_API_KEY": "openrouter-key",
+            "XAI_API_KEY": "xai-key",
         },
         fetch_codex=lambda: (codex_models, "gpt-5-codex"),
         fetch_anthropic=lambda: (claude_models, "claude-sonnet-4"),
+        fetch_deepseek=lambda: (deepseek_models, "deepseek-flash"),
         fetch_openrouter=lambda: (openrouter_models, "vendor/code-model"),
+        fetch_xai=lambda: (xai_models, "grok-4.5"),
     )
 
-    assert refresher.refresh() == {"codex": True, "claude": True, "openrouter": True}
+    assert refresher.refresh() == {
+        "codex": True,
+        "claude": True,
+        "deepseek": True,
+        "openrouter": True,
+        "xai": True,
+    }
     assert db.catalogs == [
         {"provider": "codex", "models": codex_models, "default_model": "gpt-5-codex"},
         {"provider": "claude", "models": claude_models, "default_model": "claude-sonnet-4"},
+        {"provider": "deepseek", "models": deepseek_models, "default_model": "deepseek-flash"},
         {"provider": "openrouter", "models": openrouter_models, "default_model": "vendor/code-model"},
+        {"provider": "xai", "models": xai_models, "default_model": "grok-4.5"},
     ]
     assert db.errors == []
-    assert [conn.commits for conn in db.connections] == [1, 1, 1]
+    assert [conn.commits for conn in db.connections] == [1, 1, 1, 1, 1]
 
 
 def test_refresher_preserves_existing_catalog_on_provider_failure():
@@ -455,3 +573,66 @@ def test_refresher_preserves_existing_catalog_on_provider_failure():
         {"provider": "codex", "error": "Unable to refresh the provider model catalog."},
     ]
     assert [conn.commits for conn in db.connections] == [1]
+
+
+def test_refresher_never_persists_openrouter_failure_details():
+    db = FakeDatabase()
+    secret = "openrouter-secret"
+    refresher = ModelCatalogRefresher(
+        db,
+        env={"OPENROUTER_API_KEY": secret},
+        fetch_openrouter=lambda: (_ for _ in ()).throw(RuntimeError(f"upstream rejected {secret}")),
+    )
+
+    assert refresher.refresh() == {"openrouter": False}
+    assert db.catalogs == []
+    assert db.errors == [
+        {"provider": "openrouter", "error": "Unable to refresh the provider model catalog."},
+    ]
+    assert secret not in json.dumps(db.errors)
+
+def test_fetch_hf_models_keeps_provider_suffix_and_marks_foundation_sec(monkeypatch):
+    """Foundation-Sec is only reachable with its ':featherless-ai' suffix, so
+    the id must be preserved verbatim and be the default."""
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "meta-llama/Llama-3.1-8B-Instruct"},
+                        {"id": "fdtn-ai/Foundation-Sec-8B:featherless-ai"},
+                    ]
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
+    models, default_model = fetch_hf_models("hf-test-key", 2)
+
+    ids = [model["id"] for model in models]
+    assert "fdtn-ai/Foundation-Sec-8B:featherless-ai" in ids
+    assert default_model == "fdtn-ai/Foundation-Sec-8B:featherless-ai"
+    request, timeout = requests[0]
+    assert request.full_url == "https://router.huggingface.co/v1/models"
+    assert request.get_header("Authorization") == "Bearer hf-test-key"
+    assert timeout == 2
+
+
+def test_fetch_hf_models_injects_foundation_sec_when_router_omits_it(monkeypatch):
+    """The router may not list the specialist; the catalog must still offer it
+    so ChainScope's preferred backend is always selectable."""
+
+    def fake_urlopen(request, timeout):
+        return io.BytesIO(
+            json.dumps({"data": [{"id": "meta-llama/Llama-3.1-8B-Instruct"}]}).encode("utf-8")
+        )
+
+    monkeypatch.setattr(model_catalog, "urlopen", fake_urlopen)
+    models, default_model = fetch_hf_models("hf-test-key", 2)
+
+    assert models[0]["id"] == "fdtn-ai/Foundation-Sec-8B:featherless-ai"
+    assert models[0]["isDefault"] is True
+    assert default_model == "fdtn-ai/Foundation-Sec-8B:featherless-ai"

@@ -22,30 +22,28 @@ from .provider_credentials import provider_environment
 
 LOGGER = logging.getLogger("open_kritt_engine")
 ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
-OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-OPENROUTER_RECOMMENDATION_LIMIT = 10
-OPENROUTER_FEATURED_MODEL_IDS = (
-    "z-ai/glm-5.2",
-    "moonshotai/kimi-k2.7-code",
-    "sakana/fugu-ultra",
-)
-OPENROUTER_EXCLUDED_PROVIDER_PREFIXES = ("anthropic/", "openai/")
-OPENROUTER_FEATURED_FAMILY_PREFIXES = ("moonshotai/kimi-", "~moonshotai/kimi-", "z-ai/glm-")
-OPENROUTER_EXPENSIVE_MODEL_IDS = frozenset({"sakana/fugu-ultra"})
-OPENROUTER_CODING_TERMS = (
-    "coding",
-    "codebase",
-    "software engineering",
-    "programming",
-    "developer",
-    "cyber",
-    "security",
-    "vulnerabil",
-)
+DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
+HF_MODELS_URL = "https://router.huggingface.co/v1/models"
+# Foundation-Sec is the ChainScope preferred backend; it is the security
+# specialist rather than a general model, so it is the default here.
+HF_DEFAULT_MODEL_ID = "fdtn-ai/Foundation-Sec-8B:featherless-ai"
+HF_THINKING_EFFORTS: tuple[str, ...] = ()
+DEEPSEEK_DEFAULT_MODEL_ID = "deepseek-flash"
+DEEPSEEK_THINKING_EFFORTS = ("low", "high", "max")
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models/user"
+OPENROUTER_DEFAULT_MODEL_ID = "z-ai/glm-5.2"
+XAI_MODELS_URL = "https://api.x.ai/v1/language-models"
+XAI_DEFAULT_MODEL_ID = "grok-4.6"
+XAI_THINKING_EFFORTS = ("low", "medium", "high")
+XAI_GROK_46_THINKING_EFFORTS = (*XAI_THINKING_EFFORTS, "xhigh")
+OPENROUTER_MODEL_THINKING_EFFORTS = {
+    "stealth/ox-alpha": ("low", "high", "max"),
+}
 CATALOG_REFRESH_ERROR = "Unable to refresh the provider model catalog."
 MAX_CATALOG_MODELS = 500
 MAX_CATALOG_PAGES = 10
 MAX_JSONL_BUFFER_BYTES = 5 * 1024 * 1024
+MAX_HTTP_CATALOG_BYTES = 5 * 1024 * 1024
 THINKING_EFFORT_ORDER = ("default", "low", "medium", "high", "xhigh", "max", "ultra")
 SUPPORTED_THINKING_EFFORTS = frozenset(THINKING_EFFORT_ORDER)
 OPENROUTER_GATEWAY_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -58,6 +56,7 @@ MODEL_NOTES = {
 }
 CLAUDE_MODEL_THINKING_EFFORTS = {
     "claude-fable-5": ("low", "medium", "high", "xhigh", "max"),
+    "claude-opus-5": ("low", "medium", "high", "xhigh", "max"),
     "claude-opus-4-8": ("low", "medium", "high", "xhigh", "max"),
     "claude-opus-4-7": ("low", "medium", "high", "xhigh", "max"),
     "claude-opus-4-6": ("low", "medium", "high", "max"),
@@ -108,6 +107,34 @@ def _thinking_efforts(value: Any) -> list[str]:
     return [effort for effort in THINKING_EFFORT_ORDER if effort in efforts]
 
 
+def _service_tiers(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    tiers: list[str] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            item = item.get("id")
+        tier = _clean_text(item, limit=50).lower()
+        if tier and tier not in tiers:
+            tiers.append(tier)
+    return tiers
+
+
+def model_supports_service_tier(models: Any, model_id: str, service_tier: str) -> bool:
+    """Return whether a sanitized catalog explicitly advertises a tier for a model."""
+
+    requested_model = _clean_text(model_id)
+    requested_tier = _clean_text(service_tier, limit=50).lower()
+    if not isinstance(models, list) or not requested_model or not requested_tier:
+        return False
+    for model in models:
+        if not isinstance(model, Mapping) or _clean_text(model.get("id")) != requested_model:
+            continue
+        return requested_tier in _service_tiers(model.get("serviceTiers") or model.get("service_tiers"))
+    return False
+
+
 def _openrouter_thinking_efforts(entry: Mapping[str, Any]) -> list[str]:
     """Return only effort levels explicitly exposed by OpenRouter metadata."""
 
@@ -122,6 +149,36 @@ def _openrouter_thinking_efforts(entry: Mapping[str, Any]) -> list[str]:
         # OpenRouter documents null as accepting every gateway effort value.
         return list(OPENROUTER_GATEWAY_EFFORTS)
     return _thinking_efforts(reasoning.get("supported_efforts")) or ["default"]
+
+
+def _openrouter_is_text_model(entry: Mapping[str, Any]) -> bool:
+    """Reject models explicitly limited to non-text output."""
+
+    architecture = entry.get("architecture")
+    if not isinstance(architecture, Mapping):
+        return True
+    output_modalities = architecture.get("output_modalities")
+    if not isinstance(output_modalities, list):
+        return True
+    return "text" in {_clean_text(modality).lower() for modality in output_modalities}
+
+
+def _xai_is_text_model(entry: Mapping[str, Any]) -> bool:
+    """Defensively reject a malformed language-catalog entry without text output."""
+
+    output_modalities = entry.get("output_modalities")
+    if not isinstance(output_modalities, list):
+        return True
+    return "text" in {_clean_text(modality).lower() for modality in output_modalities}
+
+
+def _xai_thinking_efforts(model_id: str) -> list[str]:
+    efforts = (
+        XAI_GROK_46_THINKING_EFFORTS
+        if model_id == XAI_DEFAULT_MODEL_ID or model_id.startswith(f"{XAI_DEFAULT_MODEL_ID}-")
+        else XAI_THINKING_EFFORTS
+    )
+    return list(efforts)
 
 
 def normalize_catalog_models(entries: Any) -> tuple[list[dict[str, Any]], str]:
@@ -150,6 +207,9 @@ def normalize_catalog_models(entries: Any) -> tuple[list[dict[str, Any]], str]:
             ),
             "isDefault": False,
         }
+        service_tiers = _service_tiers(entry.get("serviceTiers") or entry.get("service_tiers"))
+        if service_tiers:
+            model["serviceTiers"] = service_tiers
         if note:
             model["note"] = note
         if note_url:
@@ -399,84 +459,219 @@ def fetch_anthropic_models(api_key: str, timeout_seconds: float) -> tuple[list[d
 
 
 def fetch_openrouter_models(api_key: str, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
-    """Return the ten most-popular OpenRouter models oriented to code and security work."""
+    """List text models available under the configured OpenRouter account policy."""
 
     request = Request(
-        f"{OPENROUTER_MODELS_URL}?{urlencode({'sort': 'most-popular'})}",
+        OPENROUTER_MODELS_URL,
         headers={"Authorization": f"Bearer {api_key}"},
     )
     try:
         with urlopen(request, timeout=max(1.0, timeout_seconds)) as response:  # noqa: S310 - fixed provider URL
-            payload = json.load(response)
-    except (HTTPError, URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+            raw_payload = response.read(MAX_HTTP_CATALOG_BYTES + 1)
+        if len(raw_payload) > MAX_HTTP_CATALOG_BYTES:
+            raise ModelCatalogError("OpenRouter model catalog response was too large")
+        payload = json.loads(raw_payload)
+    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ModelCatalogError("Could not read the OpenRouter model catalog") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise ModelCatalogError("OpenRouter model catalog response was invalid")
 
-    available = {
-        model_id: raw
-        for raw in payload["data"]
-        if isinstance(raw, Mapping) and (model_id := _clean_text(raw.get("id")))
-    }
-    ordered: list[Mapping[str, Any]] = []
-    seen_ids: set[str] = set()
-
-    def add(raw: Mapping[str, Any] | None, *, require_coding_term: bool = True) -> None:
-        if not raw:
-            return
-        model_id = _clean_text(raw.get("id"))
-        if (
-            not model_id
-            or model_id in seen_ids
-            or model_id.startswith(OPENROUTER_EXCLUDED_PROVIDER_PREFIXES)
-            or (
-                require_coding_term
-                and model_id not in OPENROUTER_FEATURED_MODEL_IDS
-                and model_id.startswith(OPENROUTER_FEATURED_FAMILY_PREFIXES)
-            )
-        ):
-            return
-        searchable = " ".join(str(raw.get(field) or "").lower() for field in ("id", "name", "description"))
-        if require_coding_term and not any(term in searchable for term in OPENROUTER_CODING_TERMS):
-            return
-        seen_ids.add(model_id)
-        ordered.append(raw)
-
-    for model_id in OPENROUTER_FEATURED_MODEL_IDS:
-        add(available.get(model_id), require_coding_term=False)
-    for raw in payload["data"]:
-        if not isinstance(raw, Mapping):
-            continue
-        add(raw)
-        if len(ordered) >= OPENROUTER_RECOMMENDATION_LIMIT:
-            break
-
     entries: list[dict[str, Any]] = []
-    for raw in ordered[:OPENROUTER_RECOMMENDATION_LIMIT]:
+    seen_ids: set[str] = set()
+    for raw in payload["data"]:
+        if not isinstance(raw, Mapping) or not _openrouter_is_text_model(raw):
+            continue
         model_id = _clean_text(raw.get("id"))
-        display_name = raw.get("name")
-        if model_id in OPENROUTER_EXPENSIVE_MODEL_IDS:
-            display_name = f"{display_name or model_id} — expensive"
+        if not model_id or model_id in seen_ids:
+            continue
+        seen_ids.add(model_id)
+        thinking_efforts = OPENROUTER_MODEL_THINKING_EFFORTS.get(model_id)
         entries.append(
             {
                 "model": model_id,
-                "displayName": display_name,
-                "supportedReasoningEfforts": _openrouter_thinking_efforts(raw),
-                "isDefault": not entries,
+                "displayName": raw.get("name"),
+                "supportedReasoningEfforts": (
+                    list(thinking_efforts) if thinking_efforts else _openrouter_thinking_efforts(raw)
+                ),
+                "isDefault": model_id == OPENROUTER_DEFAULT_MODEL_ID,
             }
+        )
+        if len(entries) > MAX_CATALOG_MODELS:
+            candidate = entries.pop()
+            if candidate["isDefault"] and not any(entry["isDefault"] for entry in entries):
+                entries[-1] = candidate
+
+    models, default_model = normalize_catalog_models(entries)
+    if not models:
+        raise ModelCatalogError("OpenRouter model catalog was empty")
+    return models, default_model
+
+
+def fetch_deepseek_models(api_key: str, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
+    """List models available to the configured DeepSeek API key."""
+
+    request = Request(
+        DEEPSEEK_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urlopen(request, timeout=max(1.0, timeout_seconds)) as response:  # noqa: S310 - fixed provider URL
+            raw_payload = response.read(MAX_HTTP_CATALOG_BYTES + 1)
+        if len(raw_payload) > MAX_HTTP_CATALOG_BYTES:
+            raise ModelCatalogError("DeepSeek model catalog response was too large")
+        payload = json.loads(raw_payload)
+    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelCatalogError("Could not read the DeepSeek model catalog") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ModelCatalogError("DeepSeek model catalog response was invalid")
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in payload["data"]:
+        if not isinstance(raw, Mapping):
+            continue
+        model_id = _clean_text(raw.get("id"))
+        if not model_id or model_id in seen_ids:
+            continue
+        seen_ids.add(model_id)
+        entries.append(
+            {
+                "model": model_id,
+                "displayName": model_id,
+                "supportedReasoningEfforts": list(DEEPSEEK_THINKING_EFFORTS),
+                "isDefault": model_id == DEEPSEEK_DEFAULT_MODEL_ID,
+            }
+        )
+        if len(entries) >= MAX_CATALOG_MODELS:
+            break
+
+    models, default_model = normalize_catalog_models(entries)
+    if not models:
+        raise ModelCatalogError("DeepSeek model catalog was empty")
+    return models, default_model
+
+
+def fetch_hf_models(api_key: str, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
+    """List models available under the configured HuggingFace token.
+
+    The HF router is OpenAI-compatible and lists its catalogue at /v1/models.
+    Model ids carry an optional ":provider" suffix; Foundation-Sec is only
+    reachable with it, so the id is preserved verbatim.
+    """
+
+    request = Request(
+        HF_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urlopen(request, timeout=max(1.0, timeout_seconds)) as response:  # noqa: S310 - fixed provider URL
+            raw_payload = response.read(MAX_HTTP_CATALOG_BYTES + 1)
+        if len(raw_payload) > MAX_HTTP_CATALOG_BYTES:
+            raise ModelCatalogError("HuggingFace model catalog response was too large")
+        payload = json.loads(raw_payload)
+    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelCatalogError("Could not read the HuggingFace model catalog") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ModelCatalogError("HuggingFace model catalog response was invalid")
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in payload["data"]:
+        if not isinstance(raw, Mapping):
+            continue
+        model_id = _clean_text(raw.get("id"))
+        if not model_id or model_id in seen_ids:
+            continue
+        seen_ids.add(model_id)
+        entries.append(
+            {
+                "model": model_id,
+                "displayName": model_id,
+                "supportedReasoningEfforts": list(HF_THINKING_EFFORTS),
+                "isDefault": model_id == HF_DEFAULT_MODEL_ID,
+            }
+        )
+        if len(entries) >= MAX_CATALOG_MODELS:
+            break
+
+    # The router lists many models; if the specialist is absent, surface it
+        # explicitly so ChainScope's preferred backend is always selectable.
+    if not any(entry["isDefault"] for entry in entries):
+        entries.insert(0, {
+            "model": HF_DEFAULT_MODEL_ID,
+            "displayName": HF_DEFAULT_MODEL_ID,
+            "supportedReasoningEfforts": [],
+            "isDefault": True,
+        })
+
+    models, default_model = normalize_catalog_models(entries)
+    if not models:
+        raise ModelCatalogError("HuggingFace model catalog was empty")
+    return models, default_model
+
+
+def fetch_xai_models(api_key: str, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
+    """List models available under the configured xAI API key."""
+
+    request = Request(
+        XAI_MODELS_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urlopen(request, timeout=max(1.0, timeout_seconds)) as response:  # noqa: S310 - fixed provider URL
+            raw_payload = response.read(MAX_HTTP_CATALOG_BYTES + 1)
+        if len(raw_payload) > MAX_HTTP_CATALOG_BYTES:
+            raise ModelCatalogError("xAI model catalog response was too large")
+        payload = json.loads(raw_payload)
+    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelCatalogError("Could not read the xAI model catalog") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise ModelCatalogError("xAI model catalog response was invalid")
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in payload["models"]:
+        if not isinstance(raw, Mapping) or not _xai_is_text_model(raw):
+            continue
+        model_id = _clean_text(raw.get("id"))
+        if not model_id or model_id in seen_ids:
+            continue
+        seen_ids.add(model_id)
+        entries.append(
+            {
+                "model": model_id,
+                "displayName": raw.get("name") or model_id,
+                "supportedReasoningEfforts": _xai_thinking_efforts(model_id),
+                "isDefault": model_id == XAI_DEFAULT_MODEL_ID,
+            }
+        )
+        if len(entries) > MAX_CATALOG_MODELS:
+            candidate = entries.pop()
+            if candidate["isDefault"] and not any(entry["isDefault"] for entry in entries):
+                entries[-1] = candidate
+
+    if not any(entry["isDefault"] for entry in entries):
+        entries.insert(
+            0,
+            {
+                "model": XAI_DEFAULT_MODEL_ID,
+                "displayName": XAI_DEFAULT_MODEL_ID,
+                "supportedReasoningEfforts": _xai_thinking_efforts(XAI_DEFAULT_MODEL_ID),
+                "isDefault": True,
+            },
         )
 
     models, default_model = normalize_catalog_models(entries)
     if not models:
-        raise ModelCatalogError("OpenRouter coding model catalog was empty")
-    return models, default_model
+        raise ModelCatalogError("xAI model catalog was empty")
+    return models, default_model or XAI_DEFAULT_MODEL_ID
 
 
 CatalogFetcher = Callable[[], tuple[list[dict[str, Any]], str]]
 
 
 class ModelCatalogRefresher:
-    """Fetch configured native-provider catalogs and persist only safe fields."""
+    """Fetch configured provider catalogs and persist only safe fields."""
 
     def __init__(
         self,
@@ -486,7 +681,10 @@ class ModelCatalogRefresher:
         env: Mapping[str, str] | None = None,
         fetch_codex: CatalogFetcher | None = None,
         fetch_anthropic: CatalogFetcher | None = None,
+        fetch_deepseek: CatalogFetcher | None = None,
         fetch_openrouter: CatalogFetcher | None = None,
+        fetch_xai: CatalogFetcher | None = None,
+        fetch_hf: CatalogFetcher | None = None,
         codex_cli_gate: Any | None = None,
     ):
         self.db = db
@@ -494,7 +692,10 @@ class ModelCatalogRefresher:
         self._configured_env = dict(env) if env is not None else None
         self.fetch_codex = fetch_codex
         self.fetch_anthropic = fetch_anthropic
+        self.fetch_deepseek = fetch_deepseek
         self.fetch_openrouter = fetch_openrouter
+        self.fetch_xai = fetch_xai
+        self.fetch_hf = fetch_hf
         self.codex_cli_gate = codex_cli_gate
 
     def refresh(self, env: Mapping[str, str] | None = None) -> dict[str, bool]:
@@ -516,11 +717,23 @@ class ModelCatalogRefresher:
                 lambda: fetch_anthropic_models(env["ANTHROPIC_API_KEY"], self.timeout_seconds)
             )
             outcomes["claude"] = self._refresh_provider("claude", fetch_anthropic)
+        if _clean_text(env.get("DEEPSEEK_API_KEY")):
+            fetch_deepseek = self.fetch_deepseek or (
+                lambda: fetch_deepseek_models(env["DEEPSEEK_API_KEY"], self.timeout_seconds)
+            )
+            outcomes["deepseek"] = self._refresh_provider("deepseek", fetch_deepseek)
         if _clean_text(env.get("OPENROUTER_API_KEY")):
             fetch_openrouter = self.fetch_openrouter or (
                 lambda: fetch_openrouter_models(env["OPENROUTER_API_KEY"], self.timeout_seconds)
             )
             outcomes["openrouter"] = self._refresh_provider("openrouter", fetch_openrouter)
+        if _clean_text(env.get("XAI_API_KEY")):
+            fetch_xai = self.fetch_xai or (lambda: fetch_xai_models(env["XAI_API_KEY"], self.timeout_seconds))
+            outcomes["xai"] = self._refresh_provider("xai", fetch_xai)
+        hf_key = _clean_text(env.get("HF_TOKEN")) or _clean_text(env.get("HUGGINGFACE_API_KEY"))
+        if hf_key:
+            fetch_hf = self.fetch_hf or (lambda: fetch_hf_models(hf_key, self.timeout_seconds))
+            outcomes["hf"] = self._refresh_provider("hf", fetch_hf)
         return outcomes
 
     def _refresh_provider(self, provider: str, fetcher: CatalogFetcher) -> bool:
