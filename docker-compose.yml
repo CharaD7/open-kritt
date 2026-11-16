@@ -148,7 +148,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       HF_TOKEN: ${HF_TOKEN:-}
-      HF_CODEX_BASE_URL: ${HF_CODEX_BASE_URL:-http://172.17.0.1:8099/v1}
+      HF_CODEX_BASE_URL: ${HF_CODEX_BASE_URL:-http://responses-shim:8099/v1}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
       CURSOR_API_KEY: ${CURSOR_API_KEY:-}
@@ -259,6 +259,24 @@ services:
     restart: unless-stopped
     networks:
       - default
+
+
+  # Attaches responses-shim to each per-job scan network as it is created, so
+  # the codex runner (which runs on open-kritt-scan-<id>) can reach it.
+  network-joiner:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.joiner
+    container_name: open-kritt-network-joiner
+    environment:
+      SHIM_CONTAINER: ${SHIM_CONTAINER:-open-kritt-responses-shim}
+      SHIM_ALIASES: ${SHIM_ALIASES:-responses-shim}
+      SHIM_POLL_SECONDS: ${SHIM_POLL_SECONDS:-5}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - responses-shim
+    restart: unless-stopped
 
   db:
     build:
