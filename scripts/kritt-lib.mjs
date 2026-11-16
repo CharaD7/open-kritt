@@ -13,14 +13,18 @@ export const PROVIDER_KEYS = [
   'DEEPSEEK_API_KEY',
   'OPENROUTER_API_KEY',
   'XAI_API_KEY',
+  'HF_TOKEN',
+  'HUGGINGFACE_API_KEY',
 ];
 export const CODEX_LOGIN_STATUS_KEY = 'CODEX_LOGIN_CONFIGURED';
 export const MANAGED_PROVIDER_ENV_KEYS = {
+  hf: 'HF_TOKEN',
   deepseek: 'DEEPSEEK_API_KEY',
   openrouter: 'OPENROUTER_API_KEY',
   xai: 'XAI_API_KEY',
 };
 export const MANAGED_PROVIDER_LABELS = {
+  hf: 'HuggingFace token (Foundation-Sec)',
   deepseek: 'DeepSeek API key',
   openrouter: 'OpenRouter API key',
   xai: 'xAI API key',
@@ -58,6 +62,11 @@ export const ENVIRONMENT_ITEMS = [
     key: 'ANTHROPIC_API_KEY',
     label: 'Anthropic API key',
     info: 'Used by the Claude Code harness as an alternative to the guided Claude subscription login.',
+  },
+  {
+    key: 'HF_TOKEN',
+    label: 'HuggingFace token (Foundation-Sec)',
+    info: 'Used by the Codex harness against the HuggingFace Inference Router. Enables Foundation-Sec, the ChainScope review backend.',
   },
   {
     key: 'DEEPSEEK_API_KEY',
