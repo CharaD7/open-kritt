@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir aiohttp==3.14.5
+
+COPY responses_shim.py /app/responses_shim.py
+
+EXPOSE 8099
+
+CMD ["python3", "/app/responses_shim.py"]

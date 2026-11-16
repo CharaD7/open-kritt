@@ -178,7 +178,6 @@ TOOL_FREE_CODEX_DISABLED_FEATURES = (
     "apps",
     "multi_agent",
     "computer_use",
-    "web_search",
 )
 
 OPENROUTER_CLAUDE_BASE_URL = "https://openrouter.ai/api"
@@ -188,6 +187,9 @@ DEEPSEEK_CODEX_BASE_URL = "https://api.deepseek.com"
 # HuggingFace Inference Router - OpenAI-compatible. Foundation-Sec is reached
 # as "<owner>/<name>:<provider>", e.g. fdtn-ai/Foundation-Sec-8B:featherless-ai.
 HF_CODEX_BASE_URL = "https://router.huggingface.co/v1"
+# Point this at the responses-shim service to strip codex's namespace/web_search
+# tool entries. Leave as-is for providers that accept the full Responses union.
+HF_CODEX_BASE_URL_OVERRIDE_ENV = "HF_CODEX_BASE_URL"
 DEEPSEEK_CODEX_MODEL_CATALOG = "/app/open_kritt_engine/deepseek_models.json"
 OPENROUTER_MODEL_ALIASES = {
     "glm-5.2": "z-ai/glm-5.2",
@@ -1129,8 +1131,13 @@ def _append_hf_codex_config(command: list[str]) -> None:
     HF_TOKEN (or HUGGINGFACE_API_KEY).
     """
 
+    # HF_CODEX_BASE_URL lets the deployment point the provider at the
+# responses-shim service, which strips the namespace/web_search tool
+# entries that strict Responses implementations reject.
+    import os as _os
+    _base = _os.environ.get("HF_CODEX_BASE_URL", "").strip() or HF_CODEX_BASE_URL
     command.extend(["-c", 'model_providers.hf.name="HuggingFace"'])
-    command.extend(["-c", f'model_providers.hf.base_url="{HF_CODEX_BASE_URL}"'])
+    command.extend(["-c", f'model_providers.hf.base_url="{_base}"'])
     command.extend(["-c", 'model_providers.hf.env_key="HF_TOKEN"'])
     command.extend(["-c", 'model_providers.hf.wire_api="responses"'])
     command.extend(["-c", 'web_search="disabled"'])
@@ -1716,12 +1723,6 @@ def codex_exec_command(
         )
         for feature in TOOL_FREE_CODEX_DISABLED_FEATURES:
             command.extend(["--disable", feature])
-        if cli_model_provider == "hf":
-            # The HF router's Responses compatibility layer rejects codex's
-            # namespace/web_search tool entries, so no MCP or built-in tools
-            # may be advertised at all.
-            command.extend(["--disable", "mcp"])
-            command.extend(["--disable", "view_image"])
     command.extend(["--output-schema", schema_path, "-o", output_path])
     if not allow_tools and cli_model_provider == "openrouter":
         # `--ignore-user-config` removes custom providers along with user
